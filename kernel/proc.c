@@ -509,6 +509,54 @@ yield(void)
   release(&p->lock);
 }
 
+// yield the CPU to another process. Returns 0 on success, -1 on failure.
+int
+co_yield(int pid, int value)
+{
+  struct proc *p = myproc();
+  struct proc *target = 0;
+
+   if(pid <= 0 || pid == p->pid || value <= 0)
+        return -1;
+
+    // find target process
+    struct proc *pp;
+    for(pp = proc; pp < &proc[NPROC]; pp++){
+        acquire(&pp->lock);
+        if(pp->pid == pid){
+            target = pp;
+            break;
+        }
+        release(&pp->lock);
+    }
+
+    if(target == 0)
+        return -1;
+
+    if(target->killed || target->state == UNUSED || target->state == ZOMBIE){
+        release(&target->lock);
+        return -1;
+    }
+
+    acquire(&p->lock);
+
+    if(target->state == SLEEPING && target->chan == target){
+        // target is waiting in co_yield
+        target->trapframe->a0 = value;
+        target->state = RUNNABLE;
+        release(&target->lock);
+
+        sleep(p, &p->lock);
+        return p->trapframe->a0;
+    } else {
+        // target not ready yet
+        release(&target->lock);
+
+        sleep(p, &p->lock);
+        return p->trapframe->a0;
+    }
+}
+
 // A fork child's very first scheduling by scheduler()
 // will swtch to forkret.
 void
