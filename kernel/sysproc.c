@@ -89,3 +89,13 @@ sys_uptime(void)
   release(&tickslock);
   return xticks;
 }
+
+// Yield the CPU to another process. Returns 0 on success, -1 on failure.
+uint64
+sys_co_yield(void)
+{
+  int pid, value;
+  argint(0, &pid);
+  argint(1, &value);
+  return co_yield(pid, value);;
+}
