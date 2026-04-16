@@ -97,5 +97,5 @@ sys_co_yield(void)
   int pid, value;
   argint(0, &pid);
   argint(1, &value);
-  return co_yield(pid, value);;
+  return co_yield(pid, value);
 }

@@ -519,6 +519,8 @@ co_yield(int pid, int value)
    if(pid <= 0 || pid == p->pid || value <= 0)
         return -1;
 
+    acquire(&wait_lock);
+
     // find target process
     struct proc *pp;
     for(pp = proc; pp < &proc[NPROC]; pp++){
@@ -530,15 +532,17 @@ co_yield(int pid, int value)
         release(&pp->lock);
     }
 
-    if(target == 0)
-        return -1;
-
-    if(target->killed || target->state == UNUSED || target->state == ZOMBIE){
-        release(&target->lock);
+    // target process not found
+    if(target == 0){
+        release(&wait_lock);
         return -1;
     }
 
-    acquire(&p->lock);
+    if(target->killed || target->state == UNUSED || target->state == ZOMBIE){
+        release(&target->lock);
+        release(&wait_lock);
+        return -1;
+    }
 
     if(target->state == SLEEPING && target->chan == target){
         // target is waiting in co_yield
@@ -546,13 +550,15 @@ co_yield(int pid, int value)
         target->state = RUNNABLE;
         release(&target->lock);
 
-        sleep(p, &p->lock);
+        sleep(p, &wait_lock);
+        release(&wait_lock);
         return p->trapframe->a0;
     } else {
         // target not ready yet
         release(&target->lock);
 
-        sleep(p, &p->lock);
+        sleep(p, &wait_lock);
+        release(&wait_lock);
         return p->trapframe->a0;
     }
 }
