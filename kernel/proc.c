@@ -506,22 +506,27 @@ sched(void)
 // break in the few places where a lock is held but
 // there's no process.
 void
-sched_dir(struct proc *target)
+co_sched(struct proc *target)
 {
   int intena;
   struct proc *p = myproc();
 
   if(!holding(&p->lock))
     panic("sched p->lock");
-  if(mycpu()->noff != 1)
+  if(!holding(&target->lock))
+    panic("sched target->lock");
+  // We hold both p->lock and target->lock during direct handoff.
+  if(mycpu()->noff != 2)
     panic("sched locks");
-  if(p->state == RUNNING)
-    panic("sched running");
   if(intr_get())
     panic("sched interruptible");
 
   intena = mycpu()->intena;
+  target->state = RUNNING;
+  mycpu()->proc = target;
+  release(&p->lock);
   swtch(&p->context, &target->context);
+  mycpu()->proc = p;
   mycpu()->intena = intena;
 }
 
@@ -545,51 +550,71 @@ co_yield(int pid, int value)
   struct proc *p = myproc();
   struct proc *target = 0;
 
-   if(pid <= 0 || pid == p->pid || value <= 0)
-        return -1;
+  // Edge case note:
+  // This coroutine handoff assumes both peers keep participating in co_yield.
+  // If one side exits/is killed mid-rendezvous, the other side may observe an
+  // invalid target state. Under assignment constraints (no extra proc/global
+  // bookkeeping), we conservatively reject such states with -1.
 
-    acquire(&wait_lock);
+  if(pid <= 0 || pid == p->pid || value <= 0)
+    return -1;
 
-    // find target process
-    struct proc *pp;
-    for(pp = proc; pp < &proc[NPROC]; pp++){
-        acquire(&pp->lock);
-        if(pp->pid == pid){
-            target = pp;
-            break;
-        }
-        release(&pp->lock);
+  acquire(&wait_lock);
+
+  // Find the target process while holding its lock.
+  struct proc *pp;
+  for(pp = proc; pp < &proc[NPROC]; pp++){
+    acquire(&pp->lock);
+    if(pp->pid == pid){
+      target = pp;
+      break;
     }
+    release(&pp->lock);
+  }
 
-    // target process not found
-    if(target == 0){
-        release(&wait_lock);
-        return -1;
-    }
+  if(target == 0){
+    release(&wait_lock);
+    return -1;
+  }
 
-    if(target->killed || target->state == UNUSED || target->state == ZOMBIE){
-        release(&target->lock);
-        release(&wait_lock);
-        return -1;
-    }
+  if(target->killed || target->state == UNUSED || target->state == ZOMBIE){
+    release(&target->lock);
+    release(&wait_lock);
+    return -1;
+  }
 
-    if(target->state == SLEEPING && target->chan == target){
-        // target is waiting in co_yield
-        target->trapframe->a0 = value;
-        target->state = RUNNABLE;
-        release(&target->lock);
+  // In this implementation we support direct handoff only if the target is
+  // runnable, or already waiting in co_yield on itself.
+  if(target->state == SLEEPING && target->chan != target){
+    release(&target->lock);
+    release(&wait_lock);
+    return -1;
+  }
+  if(target->state != RUNNABLE &&
+     !(target->state == SLEEPING && target->chan == target)){
+    release(&target->lock);
+    release(&wait_lock);
+    return -1;
+  }
 
-        sleep_dir(p, &wait_lock, target); //problem
-        release(&wait_lock);
-        return p->trapframe->a0;
-    } else {
-        // target not ready yet
-        release(&target->lock);
+  // If target is already waiting in co_yield, complete the rendezvous now.
+  if(target->state == SLEEPING && target->chan == target){
+    int incoming = target->trapframe->a0;
+    target->trapframe->a0 = value;
+    p->trapframe->a0 = incoming;
+  } else {
+    // Target not yet waiting in co_yield: publish our value so the target can
+    // read it once it yields back to us.
+    p->trapframe->a0 = value;
+  }
 
-        sleep_dir(p, &wait_lock, target); //problem
-        release(&wait_lock);
-        return p->trapframe->a0;
-    }
+  // In both paths, sleep current process and hand off directly to target.
+  co_sleep(p, &wait_lock, target);
+  int ret = p->trapframe->a0;
+  if(!holding(&wait_lock))
+    panic("co_yield no wait_lock");
+  release(&wait_lock);
+  return ret;
 }
 
 // A fork child's very first scheduling by scheduler()
@@ -640,6 +665,8 @@ sleep(void *chan, struct spinlock *lk)
   p->chan = 0;
 
   // Reacquire original lock.
+  if(!holding(&p->lock))
+    panic("sleep no p->lock");
   release(&p->lock);
   acquire(lk);
 }
@@ -647,7 +674,7 @@ sleep(void *chan, struct spinlock *lk)
 // Atomically release lock and sleep on chan.
 // Reacquires lock when awakened.
 void
-sleep_dir(void *chan, struct spinlock *lk, struct proc *target)
+co_sleep(void *chan, struct spinlock *lk, struct proc *target)
 {
   struct proc *p = myproc();
 
@@ -665,12 +692,14 @@ sleep_dir(void *chan, struct spinlock *lk, struct proc *target)
   p->chan = chan;
   p->state = SLEEPING;
 
-  sched_dir(target);
+  co_sched(target);
 
   // Tidy up.
   p->chan = 0;
 
   // Reacquire original lock.
+  if(!holding(&p->lock))
+    panic("co_sleep no p->lock");
   release(&p->lock);
   acquire(lk);
 }
